@@ -21,7 +21,7 @@ from torch_geometric.data import Data,InMemoryDataset
 import boto3
 import random
 from scipy.stats import rankdata
-from connectivity_matrices import KendallConnectivityMeasure
+from topology.connectivity_matrices import KendallConnectivityMeasure
 from pathos.multiprocessing import ProcessingPool as Pool
 #from nilearn.connectome import ConnectivityMeasure
 

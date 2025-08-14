@@ -19,7 +19,7 @@ import NeuroGraph
 from NeuroGraph import preprocess
 import boto3
 from pathos.multiprocessing import ProcessingPool as Pool
-from connectivity_matrices import KendallConnectivityMeasure
+from topology.connectivity_matrices import KendallConnectivityMeasure
 #from nilearn.connectome import ConnectivityMeasure
 
 
