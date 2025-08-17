@@ -24,28 +24,28 @@ The construction of brain graphs from functional Magnetic Resonance Imaging (fMR
   <img src="assets/design-space-overview.png" alt="Data-centric design space for brain graph construction" width="95%">
 </p>
 
-## Data-Centric Design Space (by stage)
+## Data-Centric Design Space
 
 **1) Signal Processing**
-- **High-amplitude retention**: keep salient BOLD fluctuations (supporting `sd`/`pct` thresholds and `value`/`binary` retention) to suppress low-amplitude noise.
+- **High-amplitude retention**: emphasize salient BOLD fluctuations and suppress low-amplitude noise.
 
 **2) Topology Extraction**
-- **Functional connectivity variants**: Pearson / Spearman / Kendall.
-- **Unified graph topology**: derive a universal edge set and impose it on all subjects for consistent structure.
+- **Connectivity metrics**: Pearson, Spearman, Kendall.
+- **Unified topology**: a population-level edge set enforced across subjects for consistent structure.
 
 **3) Featurization**
-- **Dynamic (lagged) connectivity**: build `F_lag` (X vs. X(t+L)) and `F_lag_reverse`, then concatenate with the original FC.
-- **Edge-feature fusion and Multi-view node features**: 3-d binary edge attributes indicating presence in {Pearson, Spearman, Kendall} graphs.
+- **Dynamic (lagged) connectivity**: capture temporal dependencies via lagged correlations.
+- **Multi-view features**: concatenate P/S/K and lagged views for nodes; add binary edge indicators for P/S/K.
 
-> We **systematically benchmark** the above choices and their interactions across datasets, ROI resolutions, and GNN backbones.
+> We systematically benchmark these choices and their combinations across datasets, ROI scales, and GNN backbones.
 
 ---
 
-# Data Preparation
+## Data Preparation
 
 This project uses two public datasets:
 
-## 1. Human Connectome Project (HCP S1200)
+### 1. Human Connectome Project (HCP S1200)
 - [Official website](https://www.humanconnectome.org/study/hcp-young-adult/document/1200-subjects-data-release)
 - Resting-state (1,078 subjects) and task-based (>7,000 scans)
 - Preprocessed using HCP Minimal Preprocessing Pipeline
@@ -62,7 +62,7 @@ Then run (replace the empty quotes with your keys):
 
 > Note: Large downloads and long runtimes; these commands are example usage.
 
-## 2. Autism Brain Imaging Data Exchange (ABIDE)
+### 2. Autism Brain Imaging Data Exchange (ABIDE)
 - [Official website](http://fcon_1000.projects.nitrc.org/indi/abide/)
 - Resting-state (1,009 subjects)
 - Preprocessed using C-PAC pipeline
