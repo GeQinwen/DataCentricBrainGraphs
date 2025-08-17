@@ -20,13 +20,24 @@ The construction of brain graphs from functional Magnetic Resonance Imaging (fMR
 
 ---
 
-## Highlights
+<p align="center">
+  <img src="assets/design-space-overview.png" alt="Data-centric design space for brain graph construction" width="95%">
+</p>
 
-* **High-amplitude signal retention**: selectively preserves meaningful BOLD fluctuations, reducing noise.
-* **Unified graph topology**: emphasizes consistent, population-level functional connections.
-* **Dynamic connectivity modeling**: incorporates lagged correlations to capture temporal brain dynamics.
-* **Comprehensive featurization**: enriches node and edge features with multiple correlation views.
-* **Systematic benchmarking**: evaluates the interaction of data-centric strategies across datasets, models, and ROI resolutions.
+## Data-Centric Design Space (by stage)
+
+**1) Signal Processing**
+- **High-amplitude retention**: keep salient BOLD fluctuations (supporting `sd`/`pct` thresholds and `value`/`binary` retention) to suppress low-amplitude noise.
+
+**2) Topology Extraction**
+- **Functional connectivity variants**: Pearson / Spearman / Kendall.
+- **Unified graph topology**: derive a universal edge set and impose it on all subjects for consistent structure.
+
+**3) Featurization**
+- **Dynamic (lagged) connectivity**: build `F_lag` (X vs. X(t+L)) and `F_lag_reverse`, then concatenate with the original FC.
+- **Edge-feature fusion and Multi-view node features**: 3-d binary edge attributes indicating presence in {Pearson, Spearman, Kendall} graphs.
+
+> We **systematically benchmark** the above choices and their interactions across datasets, ROI resolutions, and GNN backbones.
 
 ---
 
@@ -46,7 +57,7 @@ Then run (replace the empty quotes with your keys):
 **HCP Rest:**
 `python download_hcp_rest.py --root data --name HCPGender --threshold 5 --path_to_data data/raw/HCPGender --n_rois 100 --n_jobs 1 --access_key "" --secret_key ""`
 
-**HCP State (tfMRI):**
+**HCP State:**
 `python download_hcp_state.py --root data/state_100 --name HCPState --threshold 5 --path_to_data data/raw/HCPState --n_rois 100 --n_jobs 1 --access_key "" --secret_key ""`
 
 > Note: Large downloads and long runtimes; these commands are example usage.
@@ -57,7 +68,23 @@ Then run (replace the empty quotes with your keys):
 - Preprocessed using C-PAC pipeline
 - Parcellated with Schaefer atlas (ROI=200, 400)
 
+`python download_abide.py --root data --name ABIDE --threshold 5 --path_to_data data/raw/ABIDE --n_rois 200 --n_jobs 1 --pipeline cpac --download true`
+
 ---
+
+### Reproducing the Data-Centric Design Space
+
+To explore **all methods and configurations** evaluated in the paper, please check the code under `src/`:
+
+* `src/preprocessing/`: High-amplitude retention for BOLD signals
+* `src/topology/`: Pearson/Spearman/Kendall graph construction and unified topology
+* `src/featurization/`: lagged correlation features and edge-featurization
+* `examples/`: end-to-end training example on processed `.pt`
+
+Each script exposes a consistent CLI (run `python <script>.py --help`) and includes **usage examples in the header docstring**.
+
+If anything is unclear or you hit issues, feel free to reach out: **[qinwen.ge@vanderbilt.com](mailto:qinwen.ge@vanderbilt.com)**.
+
 
 ## Citation
 
