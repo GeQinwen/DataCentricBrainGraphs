@@ -1,210 +1,302 @@
-import pandas as pd
+#!/usr/bin/env python3
+"""
+Build a PyTorch Geometric dataset with lagged-correlation featurization.
+
+---------------------
+Given per-subject z-scored time series (shape [T, N]), for each subject it:
+1) Computes the original Pearson FC:  N×N.
+2) Computes a lagged FC at lag=L by correlating X(t) with X(t+L):
+   - Build an expanded time series [T-L, 2N] = [X(0..T-L-1, :), X(L..T-1, :)].
+   - Pearson correlation over the expanded TS gives a 2N×2N block matrix.
+   - Extract the cross blocks:
+       F_lag        = Corr[0:N,     N:2N]   (X vs X_lag)
+       F_lag_reverse= Corr[N:2N,    0:N]    (X_lag vs X)
+3) Uses the original FC to build edges by keeping the top edge_pct% among
+   strictly positive correlations (symmetrized).
+4) Sets node features x according to --feature_mode:
+   - concat: [F_orig | F_lag | F_lag_reverse] → N×(k*N)
+     (k = 3 if --include_reverse else 2)
+5) Saves a PyG InMemoryDataset to <root>/processed/<name>.pt.
+
+Example
+-------
+python src/featurization/lag_correlation.py \
+  --root data/rs_100/rs_100_lag5_concat \
+  --name HCPGender \
+  --ts_dir data/raw/HCPGender/time_series_100 \
+  --lag 5 \
+  --edge_pct 5 \
+  --include_reverse \
+  --n_jobs 1
+"""
+
+import argparse
 import os
-import nibabel as nib
+import glob
 import pickle
+from typing import Optional, List
+
 import numpy as np
-from nilearn.datasets import fetch_atlas_schaefer_2018
-from nilearn.image import load_img
-from scipy.stats import zscore
-import torch
-from torch_geometric.data import Data,InMemoryDataset
-from random import randrange
-import math
-import zipfile
+import pandas as pd
 from joblib import Parallel, delayed
 from tqdm import tqdm
-import itertools
+
 import torch
-import NeuroGraph
-from NeuroGraph import preprocess
-import boto3
-from pathos.multiprocessing import ProcessingPool as Pool
+from torch_geometric.data import Data, InMemoryDataset
 from nilearn.connectome import ConnectivityMeasure
 
 
-def worker_function(args):
-    iid, behavioral_df, BUCKET_NAME, volume,lag = args
-    return Brain_Connectome_Rest_Download.get_data_obj_static(iid, behavioral_df, BUCKET_NAME, volume,lag)
+# ----------------------------- helpers ------------------------------------ #
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
+def _find_ts_path(ts_dir: str, sid: str) -> Optional[str]:
+    """
+    Locate a subject's time-series file.
+    Primary: {sid}_time_series.npy
+    Fallback: {sid}_*_time_series.npy (prefer files containing 'REST1_LR').
+    """
+    primary = os.path.join(ts_dir, f"{sid}_time_series.npy")
+    if os.path.exists(primary):
+        return primary
+    pattern = os.path.join(ts_dir, f"{sid}_*_time_series.npy")
+    matches = glob.glob(pattern)
+    if not matches:
+        return None
+    preferred = [m for m in matches if "REST1_LR" in os.path.basename(m)]
+    return preferred[0] if preferred else matches[0]
 
-class Brain_Connectome_Rest_Download(InMemoryDataset):
-    
-    def __init__(self, root,name,n_rois, threshold,path_to_data,n_jobs,s3,lag, transform=None, pre_transform=None, pre_filter=None):
-        self.root, self.dataset_name,self.n_rois,self.graph_threshold,self.target_path,self.n_jobs,self.s3,self.lag = root, name,n_rois,threshold,path_to_data,n_jobs,s3,lag
+
+def _top_positive_percentile_adj(corr_tensor: torch.Tensor, edge_pct: float) -> torch.Tensor:
+    """
+    Keep the top 'edge_pct' percent among strictly positive correlations.
+    Returns a symmetrized binary adjacency (torch.float32) of shape [N, N].
+    """
+    A = corr_tensor.clone()
+    pos_vals = A[A > 0].detach().cpu().numpy()
+    if pos_vals.size == 0:
+        A[:] = 0.0
+        return A
+    cutoff = np.percentile(pos_vals, 100 - edge_pct)
+    A[A < cutoff] = 0.0
+    A[A >= cutoff] = 1.0
+    A = torch.maximum(A, A.t())
+    return A
+
+
+def _pearson_fc(ts: np.ndarray) -> np.ndarray:
+    """
+    Pearson FC using nilearn ConnectivityMeasure. Returns N×N with zero diagonal.
+    """
+    conn = ConnectivityMeasure(kind='correlation')
+    fc = conn.fit_transform([ts])[0].astype(np.float32)
+    np.fill_diagonal(fc, 0.0)
+    return fc
+
+
+def _expand_time_series(ts: np.ndarray, lag: int) -> np.ndarray:
+    """
+    Concatenate X(t) and X(t+lag) column-wise to produce [T-lag, 2N].
+    - ts: [T, N]
+    - lag: positive integer < T
+    """
+    T, N = ts.shape
+    if lag <= 0 or lag >= T:
+        raise ValueError(f"--lag must be in [1, T-1]; got lag={lag}, T={T}")
+    truncated = ts[:-lag, :]   # [T-lag, N]  -> X(t)
+    shifted  = ts[lag:,  :]    # [T-lag, N]  -> X(t+lag)
+    expanded = np.concatenate([truncated, shifted], axis=1).astype(np.float32)  # [T-lag, 2N]
+    return expanded
+
+
+def _lagged_blocks(ts: np.ndarray, lag: int, include_reverse: bool) -> np.ndarray:
+    """
+    Compute lagged cross-correlation blocks from expanded TS.
+    Returns either:
+      - [F_lag]                       (N×N) if include_reverse=False
+      - [F_lag | F_lag_reverse]      (N×(2N)) if include_reverse=True and concatenated horizontally
+    """
+    T, N = ts.shape
+    expanded = _expand_time_series(ts, lag)                 # [T-lag, 2N]
+    conn = ConnectivityMeasure(kind='correlation')
+    big_fc = conn.fit_transform([expanded])[0].astype(np.float32)  # [2N, 2N]
+    # Extract blocks
+    F_lag = big_fc[0:N,     N:2*N].copy()
+    np.fill_diagonal(F_lag, 0.0)
+    if include_reverse:
+        F_rev = big_fc[N:2*N, 0:N].copy()
+        np.fill_diagonal(F_rev, 0.0)
+        return np.concatenate([F_lag, F_rev], axis=1)       # N×(2N)
+    else:
+        return F_lag                                        # N×N
+
+
+# -------------------------- dataset definition ---------------------------- #
+
+class BrainConnectomeLaggedFC(InMemoryDataset):
+    """
+    Creates a PyG dataset where:
+      - edge_index: built from top edge_pct% positive edges of the ORIGINAL FC.
+      - x: node features determined by --feature_mode:
+           * 'concat' (default): [F_orig | F_lag | (optional F_rev)] → N×(k*N)
+           * 'original': F_orig only → N×N
+      - y: tensor([gender, ageclass, listsort, pmat])
+    """
+
+    def __init__(
+        self,
+        root: str,
+        name: str,
+        ts_dir: str,
+        ids_pkl: str,
+        behavior_csv: str,
+        lag: int,
+        edge_pct: float,
+        feature_mode: str = "concat",
+        include_reverse: bool = True,
+        n_jobs: int = 1,
+        transform=None,
+        pre_transform=None,
+        pre_filter=None,
+    ):
+        self.root = root
+        self.dataset_name = name
+        self.ts_dir = ts_dir
+        self.ids_pkl = ids_pkl
+        self.behavior_csv = behavior_csv
+        self.lag = int(lag)
+        self.edge_pct = float(edge_pct)
+        self.feature_mode = feature_mode
+        self.include_reverse = bool(include_reverse)
+        self.n_jobs = int(n_jobs)
+
         super().__init__(root, transform, pre_transform, pre_filter)
-        
         self.data, self.slices = torch.load(self.processed_paths[0])
 
-
     @property
-    def processed_file_names(self):
-        return [self.dataset_name+'.pt']
-    
-#input: atlas, fmri. output: roi * time series
-    @staticmethod
-    def extract_from_3d_no(volume, fmri):
-        ''' 
-        Extract time-series data from a 3d atlas with non-overlapping ROIs.
-        
-        Inputs:
-            path_to_atlas = '/path/to/atlas.nii.gz'
-            path_to_fMRI = '/path/to/fmri.nii.gz'
-            
-        Output:
-            returns extracted time series # volumes x # ROIs
-        '''
+    def processed_file_names(self) -> List[str]:
+        return [f"{self.dataset_name}.pt"]
 
-        subcor_ts = []
-        for i in np.unique(volume): #volume is the atlas
-            if i != 0: #create a mask for each roi
-    #             print(i)
-                bool_roi = np.zeros(volume.shape, dtype=int)
-                bool_roi[volume == i] = 1
-                bool_roi = bool_roi.astype(bool)
-    #             print(bool_roi.shape)
-                # extract time-series data for each roi
-                roi_ts_mean = []
-                for t in range(fmri.shape[-1]):#average fmri signal of each roi over time
-                    roi_ts_mean.append(np.mean(fmri[:, :, :, t][bool_roi]))
-                subcor_ts.append(np.array(roi_ts_mean))
-        Y = np.array(subcor_ts).T # Y=roi x time series
-        return Y
-
-
-    @staticmethod
-    def construct_Adj_postive_perc(corr,graph_threshold):
-        corr_matrix_copy = corr.detach().clone()
-        threshold = np.percentile(corr_matrix_copy[corr_matrix_copy > 0],
-                                  100 - graph_threshold)
-        corr_matrix_copy[corr_matrix_copy < threshold] = 0
-        corr_matrix_copy[corr_matrix_copy >= threshold] = 1
-        return corr_matrix_copy
-    
-    @staticmethod
-    def expand_time_series(time_series, lag):
-        #time_series shape = (1200, 400) i.e. (timepoints, roi)
-        expanded_ts = []
-        num_time_points, num_rois = time_series.shape
-        #ts_length = num_time_points - lag
-        truncated_time_series = time_series[:-lag]
-        lagged_time_series = time_series[lag:]
-        expanded_ts.append(truncated_time_series)
-        print("lagged_time_series", lagged_time_series.shape)
-        print("truncated_time_series", truncated_time_series.shape)
-        expanded_ts.append(lagged_time_series)
-        return np.concatenate(expanded_ts, axis=1)
-
-    @staticmethod
-    def construct_expanded_correlation_matrix(expanded_ts):
-        conn = ConnectivityMeasure(kind='correlation')
-        corr_matrix = conn.fit_transform([expanded_ts])[0]
-        np.fill_diagonal(corr_matrix, 0)
-        return corr_matrix
-
-    @staticmethod
-    def construct_expanded_lagged_corr(time_series, lag):
-        #for i in range(num_lag):
-        expanded_ts = Brain_Connectome_Rest_Download.expand_time_series(time_series, lag)
-        expanded_corr_matrix = Brain_Connectome_Rest_Download.construct_expanded_correlation_matrix(expanded_ts)
-        print("expanded_corr_matrix", expanded_corr_matrix.shape)
-
-        return expanded_corr_matrix
-
-    
-    @staticmethod
-    def get_data_obj_static(iid,behavioral_data,BUCKET_NAME,volume,lag):
+    # -- core per-subject processing --
+    def _process_one(self, sid: str, behavioral_df: pd.DataFrame) -> Optional[Data]:
         try:
-            time_series_file_path = "data/raw/HCPGender/time_series_1000"
-            # print("check!",iid)
-            time_series_file = os.path.join(time_series_file_path, f"{iid}_time_series.npy")
-            
-            zd_Ytm = np.load(time_series_file)
-            
-            threshold = 30
-            positive_threshold_value = np.percentile(zd_Ytm[zd_Ytm > 0], 100 - threshold)
-            zd_Ytm[zd_Ytm < positive_threshold_value] = 0
-            #zd_Ytm[zd_Ytm >= positive_threshold_value] = 1
-            
-            expanded_corr_matrix = Brain_Connectome_Rest_Download.construct_expanded_lagged_corr(zd_Ytm, lag)
-        
-            lag_corr = expanded_corr_matrix[0:1000, 1000:2000]
-            #lag_corr = expanded_corr_matrix[0:400, 400:800]
-            #lag_corr = expanded_corr_matrix[0:100, 100:200]
-            np.fill_diagonal(lag_corr, 0)
-            
-            lag_corr_reverse = expanded_corr_matrix[1000:2000, 0:1000]
-            #lag_corr_reverse = expanded_corr_matrix[400:800, 0:400]
-            #lag_corr_reverse = expanded_corr_matrix[100:200, 0:100]
-            np.fill_diagonal(lag_corr_reverse, 0)
+            sid_str = str(sid)
+            ts_path = _find_ts_path(self.ts_dir, sid_str)
+            if ts_path is None:
+                print(f"[WARN] time series not found for {sid_str} in {self.ts_dir}")
+                return None
 
-            conn = ConnectivityMeasure(kind='correlation')
-            zd_fc = conn.fit_transform([zd_Ytm])[0]
-            np.fill_diagonal(zd_fc, 0)
-            corr_original = torch.tensor(zd_fc).to(torch.float)
-            A = Brain_Connectome_Rest_Download.construct_Adj_postive_perc(corr_original, graph_threshold=5)
+            # Load time series (assumed z-scored). Shape: [T, N]
+            ts = np.load(ts_path)
+            if ts.ndim != 2:
+                raise ValueError(f"Expected 2D time series [T, N], got {ts.shape} for SID {sid_str}")
+            T, N = ts.shape
+
+            # Original FC for edges
+            F_orig = _pearson_fc(ts)                  # N×N
+            corr_orig = torch.from_numpy(F_orig)
+
+            # Build adjacency from original FC (top positive %)
+            A = _top_positive_percentile_adj(corr_orig, self.edge_pct)
             edge_index = A.nonzero().t().to(torch.long)
-            
-            # Stack the matrices along a new dimension
-            concat_matrix = np.concatenate((zd_fc, lag_corr,lag_corr_reverse), axis=1)
-            
-            corr = torch.tensor(concat_matrix).to(torch.float)
-            iid = int(iid)
-            gender = behavioral_data.loc[iid,'Gender']
-            g = 1 if gender=="M" else 0
-            labels = torch.tensor([g,behavioral_data.loc[iid,'AgeClass'],behavioral_data.loc[iid,'ListSort_AgeAdj'],behavioral_data.loc[iid,'PMAT24_A_CR']])
-            data = Data(x=corr, edge_index=edge_index, y=labels) 
-        except:
+
+            # Build node features
+            if self.feature_mode == "original":
+                X = F_orig
+            elif self.feature_mode == "concat":
+                F_lag_blocks = _lagged_blocks(ts, self.lag, self.include_reverse)  # N×N or N×(2N)
+                X = np.concatenate([F_orig, F_lag_blocks], axis=1).astype(np.float32)  # N×(k*N)
+            else:
+                raise ValueError("--feature_mode must be 'concat' or 'original'")
+
+            x = torch.from_numpy(X)
+
+            # Labels: [gender, ageclass, listsort, pmat]
+            sid_int = int(sid)
+            gender = behavioral_df.loc[sid_int, 'Gender']
+            g = 1 if gender == 'M' else 0
+            labels = torch.tensor([
+                g,
+                behavioral_df.loc[sid_int, 'AgeClass'],
+                behavioral_df.loc[sid_int, 'ListSort_AgeAdj'],
+                behavioral_df.loc[sid_int, 'PMAT24_A_CR'],
+            ], dtype=torch.float32)
+
+            return Data(x=x, edge_index=edge_index, y=labels)
+
+        except Exception as e:
+            print(f"[ERROR] subject {sid}: {e}")
             return None
-        return data
 
-
-#         ...
-    def process(self):
-        path_doc = "data/"
-        behavioral_df = pd.read_csv(os.path.join(path_doc,'HCP_behavioral.csv')).set_index('Subject')[['Gender','Age','ListSort_AgeAdj','PMAT24_A_CR']]
-        mapping = {'22-25':0, '26-30':1,'31-35':2,'36+':3}
+    def process(self) -> None:
+        # Behavior & IDs (HCP-style)
+        behavioral_df = pd.read_csv(self.behavior_csv).set_index('Subject')[
+            ['Gender', 'Age', 'ListSort_AgeAdj', 'PMAT24_A_CR']
+        ]
+        mapping = {'22-25': 0, '26-30': 1, '31-35': 2, '36+': 3}
         behavioral_df['AgeClass'] = behavioral_df['Age'].replace(mapping)
 
-        dataset = []
-        BUCKET_NAME = 'hcp-openaccess'
-        
-        with open(os.path.join(path_doc,"ids.pkl"),'rb') as f:
+        with open(self.ids_pkl, 'rb') as f:
             ids = pickle.load(f)
-        print(len(ids))
-        roi = fetch_atlas_schaefer_2018(n_rois=self.n_rois,yeo_networks=17, resolution_mm=2)
-        atlas = load_img(roi['maps'])
-        volume = atlas.get_fdata()
-        lag = self.lag
-        #data_list = Parallel(n_jobs=self.n_jobs)(delayed(self.get_data_obj_static)(iid,behavioral_df,BUCKET_NAME,volume) for iid in tqdm(test_ids))
-        tasks = [(iid, behavioral_df, BUCKET_NAME, volume,lag) for iid in ids]
-        with Pool(self.n_jobs) as pool:
-            data_list = pool.map(worker_function, tasks)
 
-        dataset = [x for x in data_list if x is not None]
-        # print(len(dataset))
+        results = Parallel(n_jobs=self.n_jobs, prefer='processes')(
+            delayed(self._process_one)(sid, behavioral_df) for sid in tqdm(ids)
+        )
+        data_list = [d for d in results if d is not None]
+
         if self.pre_filter is not None:
-            dataset = [data for data in dataset if self.pre_filter(data)]
-
+            data_list = [d for d in data_list if self.pre_filter(d)]
         if self.pre_transform is not None:
-            dataset = [self.pre_transform(data) for data in dataset]
+            data_list = [self.pre_transform(d) for d in data_list]
 
-        data, slices = self.collate(dataset)
-        print("saving path:",self.processed_paths[0])
+        data, slices = self.collate(data_list)
+        _ensure_dir(self.processed_dir)
         torch.save((data, slices), self.processed_paths[0])
 
 
-for i in range(3,9):
-    root = "data/rs_1000/rs_1000_thre30_"+str(i)+"lag/"
-    lag = i
-    name = "HCPGender"
-    threshold = 5
-    path_to_data = "data/raw/HCPGender"  # store the raw downloaded scans
-    n_rois = 1000
-    n_jobs = 30 # this script runs in parallel and requires the number of jobs is an input
+# ------------------------------- CLI -------------------------------------- #
 
-    ACCESS_KEY = ''  # your connectomeDB credentials
-    SECRET_KEY = ''
-    s3 = boto3.client('s3', aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY)
-    # this function requires both HCP_behavioral.csv and ids.pkl files under the root directory. Both files have been provided and can be found under the data directory
-    rest_dataset = Brain_Connectome_Rest_Download(root,name,n_rois, threshold,path_to_data,n_jobs,s3,lag)
+def main():
+    p = argparse.ArgumentParser(description="Build PyG dataset with lagged-correlation featurization")
+    p.add_argument('--root', type=str, required=True,
+                   help='Dataset root (PyG style); output .pt goes under <root>/processed')
+    p.add_argument('--name', type=str, required=True,
+                   help='Dataset name; saved as <name>.pt')
+    p.add_argument('--ts_dir', type=str, required=True,
+                   help='Directory containing {id}_time_series.npy files')
+    p.add_argument('--ids_pkl', type=str, default='data/ids.pkl',
+                   help='Path to ids.pkl (default: data/ids.pkl)')
+    p.add_argument('--behavior_csv', type=str, default='data/HCP_behavioral.csv',
+                   help='Path to HCP_behavioral.csv (default: data/HCP_behavioral.csv)')
+
+    p.add_argument('--lag', type=int, default=5,
+                   help='Time lag (in TRs) for lagged correlation (default: 5)')
+    p.add_argument('--edge_pct', type=float, default=5.0,
+                   help='Top positive percent edges when building adjacency from ORIGINAL FC (default: 5)')
+    p.add_argument('--feature_mode', type=str, choices=['concat', 'original'], default='concat',
+                   help="Node feature mode: 'concat' ([F_orig|F_lag|F_rev?]) or 'original' (F_orig only)")
+    p.add_argument('--include_reverse', action='store_true',
+                   help='If set, also include reverse-lag block (X_lag vs X) in features when using concat mode')
+    p.add_argument('--n_jobs', type=int, default=1,
+                   help='Parallel workers (default: 1)')
+
+    args = p.parse_args()
+
+    BrainConnectomeLaggedFC(
+        root=args.root,
+        name=args.name,
+        ts_dir=args.ts_dir,
+        ids_pkl=args.ids_pkl,
+        behavior_csv=args.behavior_csv,
+        lag=args.lag,
+        edge_pct=args.edge_pct,
+        feature_mode=args.feature_mode,
+        include_reverse=args.include_reverse,
+        n_jobs=args.n_jobs,
+    )
+
+
+if __name__ == '__main__':
+    main()

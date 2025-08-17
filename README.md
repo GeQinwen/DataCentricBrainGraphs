@@ -30,6 +30,35 @@ The construction of brain graphs from functional Magnetic Resonance Imaging (fMR
 
 ---
 
+# Data Preparation
+
+This project uses two public datasets:
+
+## 1. Human Connectome Project (HCP S1200)
+- [Official website](https://www.humanconnectome.org/study/hcp-young-adult/document/1200-subjects-data-release)
+- Resting-state (1,078 subjects) and task-based (>7,000 scans)
+- Preprocessed using HCP Minimal Preprocessing Pipeline
+- Parcellated with Schaefer atlas (ROI=100, 400, 1000)
+
+Get your AWS keys from HCP ConnectomeDB: [https://db.humanconnectome.org](https://db.humanconnectome.org)
+Then run (replace the empty quotes with your keys):
+
+**HCP Rest:**
+`python download_hcp_rest.py --root data --name HCPGender --threshold 5 --path_to_data data/raw/HCPGender --n_rois 100 --n_jobs 1 --access_key "" --secret_key ""`
+
+**HCP State (tfMRI):**
+`python download_hcp_state.py --root data/state_100 --name HCPState --threshold 5 --path_to_data data/raw/HCPState --n_rois 100 --n_jobs 1 --access_key "" --secret_key ""`
+
+> Note: Large downloads and long runtimes; these commands are example usage.
+
+## 2. Autism Brain Imaging Data Exchange (ABIDE)
+- [Official website](http://fcon_1000.projects.nitrc.org/indi/abide/)
+- Resting-state (1,009 subjects)
+- Preprocessed using C-PAC pipeline
+- Parcellated with Schaefer atlas (ROI=200, 400)
+
+---
+
 ## Citation
 
 If you use our work, please cite:
