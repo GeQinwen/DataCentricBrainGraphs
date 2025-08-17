@@ -83,7 +83,7 @@ To explore **all methods and configurations** evaluated in the paper, please che
 
 Each script exposes a consistent CLI (run `python <script>.py --help`) and includes **usage examples in the header docstring**.
 
-If anything is unclear or you hit issues, feel free to reach out: **[qinwen.ge@vanderbilt.com](mailto:qinwen.ge@vanderbilt.com)**.
+If anything is unclear or you hit issues, feel free to reach out: **[qinwen.ge@vanderbilt.edu](mailto:qinwen.ge@vanderbilt.edu)**.
 
 
 ## Citation
