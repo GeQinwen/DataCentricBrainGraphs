@@ -14,7 +14,7 @@
 
 ## Introduction
 
-This repository hosts the resources for the paper *[Defining and Benchmarking a Data-Centric Design Space for Brain Graph Construction]()*.
+This repository hosts the resources for the paper *[Defining and Benchmarking a Data-Centric Design Space for Brain Graph Construction](https://arxiv.org/abs/2508.12533)*.
 
 The construction of brain graphs from functional Magnetic Resonance Imaging (fMRI) data plays a crucial role in enabling graph machine learning for neuroimaging. However, current practices often rely on rigid pipelines that overlook critical data-centric choices in how brain graphs are constructed. In this work, we adopt a Data-Centric AI perspective and systematically define and benchmark a data-centric design space for brain graph construction, constrasting with primarily model-centric prior work. We organize this design space into three stages: temporal signal processing, topology extraction, and graph featurization. Our contributions lie less in novel components and more in evaluating how combinations of existing and modified techniques influence downstream performance. Specifically, we study high-amplitude BOLD signal filtering, sparsification and unification strategies for connectivity, alternative correlation metrics, and multi-view node and edge features, such as incorporating lagged dynamics. Experiments on the HCP1200 and ABIDE datasets show that thoughtful data-centric configurations consistently improve classification accuracy over standard pipelines. These findings highlight the critical role of upstream data decisions and underscore the importance of systematically exploring the data-centric design space for graph-based neuroimaging.
 
@@ -91,5 +91,10 @@ If anything is unclear or you hit issues, feel free to reach out: **[qinwen.ge@v
 If you use our work, please cite:
 
 ```bibtex
-
+@article{ge2025defining,
+  title={Defining and Benchmarking a Data-Centric Design Space for Brain Graph Construction},
+  author={Ge, Qinwen and Bayrak, Roza G and Said, Anwar and Chang, Catie and Koutsoukos, Xenofon and Derr, Tyler},
+  journal={arXiv preprint arXiv:2508.12533},
+  year={2025}
+}
 ```
